@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+from pathlib import Path
 
 import discord
 from discord.ext import tasks
@@ -18,9 +19,14 @@ logging.basicConfig(
 log = logging.getLogger("status_watcher")
 
 # --------------------------
-# قراءة .env
+# قراءة .env (لو موجود)
 # --------------------------
-load_dotenv()
+env_path = Path(__file__).parent / ".env"
+if env_path.exists():
+    log.info(f"📄 .env file found at {env_path}, loading it...")
+    load_dotenv(env_path)
+else:
+    log.info("ℹ️ No .env file found, relying on system environment variables only.")
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
@@ -33,12 +39,17 @@ MONITORED_BOT_IDS = [
 ]
 
 # IDs الأدمنز اللي هيتمنشنوا لو بوت بقى Offline
-ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+ADMIN_IDS = [
+    int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()
+]
 
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "30"))
 
 if not DISCORD_TOKEN:
-    raise RuntimeError("DISCORD_TOKEN not found in .env")
+    raise RuntimeError(
+        "DISCORD_TOKEN is not set. "
+        "Set it in a local .env file for development, or as an Environment Variable on Railway."
+    )
 
 # --------------------------
 # إعداد البوت (intents)
