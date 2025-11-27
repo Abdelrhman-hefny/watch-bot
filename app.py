@@ -549,7 +549,7 @@ class StatusWatcher(discord.Client):
 
             # embed just for nice formatting (no need ل mentions جوه الوصف)
             embed = discord.Embed(
-                title=f"🔴 Bot Offline {bot_mention",
+                title=f"🔴 Bot Offline {bot_mention}",
                 description="A monitored bot just went offline.",
                 color=discord.Color.red(),
             )
