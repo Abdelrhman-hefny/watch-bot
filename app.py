@@ -1,5 +1,4 @@
 import os
-import asyncio
 import logging
 from pathlib import Path
 
@@ -59,8 +58,8 @@ class StatusWatcher(discord.Client):
     def __init__(self, **kwargs):
         super().__init__(intents=intents, **kwargs)
         # store last known status for each monitored bot
-        self.last_status: dict[int, str] = {}
-        self.session: aiohttp.ClientSession | None = None
+        self.last_status = {}
+        self.session = None
 
     async def setup_hook(self):
         # HTTP session for webhook
@@ -153,74 +152,48 @@ class StatusWatcher(discord.Client):
     ):
         bot_mention = f"<@{bot_id}>"
 
-        def pretty_status(status: str) -> str:
-            if status == "not_in_guild":
-                return "Not in guild / unreachable"
-            return status.capitalize()
+        offline_states = {"offline", "invisible", "not_in_guild"}
 
-        # consider anything that is not offline as "online-ish"
-        is_now_offline = new_status in ("offline", "invisible", "not_in_guild")
-        was_offline = old_status in ("offline", "invisible", "not_in_guild")
+        is_now_offline = new_status in offline_states
+        was_offline = old_status in offline_states
 
-        # choose style depending on transition
+        # Went ONLINE
         if not is_now_offline and was_offline:
-            # went ONLINE
-            title = "Bot is back online"
-            emoji = "🟢"
-            color = discord.Color.green()
-            description = (
-                f"{emoji} {bot_mention} is now **Online**.\n"
-                f"New status: `{pretty_status(new_status)}`"
+            log.info(f"Bot {bot_id} went ONLINE: {old_status} -> {new_status}")
+
+            embed = discord.Embed(
+                title="Bot Online",
+                description=f"🟢 {bot_mention} is now **Online**.",
+                color=discord.Color.green(),
             )
+            embed.set_footer(text="Status Watcher")
+            await channel.send(embed=embed)
+
+        # Went OFFLINE
         elif is_now_offline and not was_offline:
-            # went OFFLINE
-            title = "Bot went offline"
-            emoji = "🔴"
-            color = discord.Color.red()
-            description = (
-                f"{emoji} {bot_mention} is now **Offline / Sleeping**.\n"
-                f"New status: `{pretty_status(new_status)}`"
+            log.info(f"Bot {bot_id} went OFFLINE: {old_status} -> {new_status}")
+
+            embed = discord.Embed(
+                title="Bot Offline",
+                description=f"🔴 {bot_mention} is now **Offline / Sleeping**.",
+                color=discord.Color.red(),
             )
+            embed.set_footer(text="Status Watcher")
+            await channel.send(embed=embed)
+
+        # Other transitions (idle/dnd/online<->idle) are ignored
         else:
-            # other transitions (idle <-> dnd <-> online)
-            title = "Bot status changed"
-            emoji = "🟡"
-            color = discord.Color.yellow()
-            description = (
-                f"{emoji} {bot_mention} changed status.\n"
-                f"Old: `{pretty_status(old_status)}` → New: `{pretty_status(new_status)}`"
+            log.info(
+                f"Ignored minor state change: {bot_id} {old_status} -> {new_status}"
             )
+            return
 
-        # log
-        log.info(f"{title}: {bot_mention} {old_status} -> {new_status}")
-
-        # create embed
-        embed = discord.Embed(
-            title=title,
-            description=description,
-            color=color,
-        )
-        embed.add_field(
-            name="Previous status",
-            value=f"`{pretty_status(old_status)}`",
-            inline=True,
-        )
-        embed.add_field(
-            name="Current status",
-            value=f"`{pretty_status(new_status)}`",
-            inline=True,
-        )
-        embed.set_footer(text="Status Watcher")
-
-        # send to Discord channel
-        await channel.send(embed=embed)
-
-        # also send a simple text line to the webhook (optional)
+        # Optional: send a simple line to the webhook as well
         if WEBHOOK_URL and self.session:
             try:
-                webhook_message = f"{emoji} {bot_mention} status changed: `{old_status}` → `{new_status}`"
+                msg = f"{bot_mention} state changed: `{old_status}` → `{new_status}`"
                 payload = {
-                    "content": webhook_message,
+                    "content": msg,
                     "allowed_mentions": {"parse": ["users"]},
                 }
                 async with self.session.post(WEBHOOK_URL, json=payload) as resp:
