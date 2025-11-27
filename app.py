@@ -62,6 +62,11 @@ ARCHIVE_INACTIVE_DAYS = int(os.getenv("ARCHIVE_INACTIVE_DAYS", "10"))
 # Log channel for important errors
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
 
+# Admin IDs to mention when a monitored bot goes offline
+ADMIN_IDS = [
+    int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()
+]
+
 if not DISCORD_TOKEN:
     raise RuntimeError(
         "DISCORD_TOKEN is not set. "
@@ -529,9 +534,22 @@ class StatusWatcher(discord.Client):
         elif is_now_offline and not was_offline:
             log.info(f"Bot {bot_id} went OFFLINE: {old_status} -> {new_status}")
 
+            # build admin mentions (if configured)
+            admin_mentions = (
+                " ".join(f"<@{admin_id}>" for admin_id in ADMIN_IDS)
+                if ADMIN_IDS
+                else ""
+            ).strip()
+
+            description = (
+                f"🔴 {bot_mention} is now **Offline / Sleeping**."
+            )
+            if admin_mentions:
+                description += f" {admin_mentions}"
+
             embed = discord.Embed(
                 title="Bot Offline",
-                description=f"🔴 {bot_mention} is now **Offline / Sleeping**.",
+                description=description,
                 color=discord.Color.red(),
             )
             embed.set_footer(text="Status Watcher")
