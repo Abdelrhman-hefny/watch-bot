@@ -541,19 +541,21 @@ class StatusWatcher(discord.Client):
                 else ""
             ).strip()
 
-            description = (
-                f"🔴 {bot_mention} is now **Offline / Sleeping**."
-            )
+            # content (outside embed) → this will actually ping
             if admin_mentions:
-                description += f" {admin_mentions}"
+                content = f"{admin_mentions} 🔴 {bot_mention} is now **Offline / Sleeping**."
+            else:
+                content = f"🔴 {bot_mention} is now **Offline / Sleeping**."
 
+            # embed just for nice formatting (no need ل mentions جوه الوصف)
             embed = discord.Embed(
                 title="Bot Offline",
-                description=description,
+                description="A monitored bot just went offline.",
                 color=discord.Color.red(),
             )
             embed.set_footer(text="Status Watcher")
-            await channel.send(embed=embed)
+
+            await channel.send(content=content, embed=embed)
 
         # Other transitions (idle/dnd/online<->idle) are ignored
         else:
