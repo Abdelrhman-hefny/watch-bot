@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 import aiohttp
 
 # --------------------------
-# إعداد اللوج
+# Logging setup
 # --------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -19,7 +19,7 @@ logging.basicConfig(
 log = logging.getLogger("status_watcher")
 
 # --------------------------
-# قراءة .env (لو موجود)
+# Load .env locally (if exists)
 # --------------------------
 env_path = Path(__file__).parent / ".env"
 if env_path.exists():
@@ -33,14 +33,9 @@ GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 STATUS_CHANNEL_ID = int(os.getenv("STATUS_CHANNEL_ID", "0"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 
-# IDs البوتات اللي هتتراقب
+# IDs of the bots to monitor (comma-separated in env)
 MONITORED_BOT_IDS = [
     int(x.strip()) for x in os.getenv("MONITORED_BOT_IDS", "").split(",") if x.strip()
-]
-
-# IDs الأدمنز اللي هيتمنشنوا لو بوت بقى Offline
-ADMIN_IDS = [
-    int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()
 ]
 
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "30"))
@@ -52,30 +47,31 @@ if not DISCORD_TOKEN:
     )
 
 # --------------------------
-# إعداد البوت (intents)
+# Discord intents
 # --------------------------
 intents = discord.Intents.default()
-intents.members = True  # عشان نجيب حالة البوتات
-intents.presences = True  # presence (online/offline)
+intents.members = True      # needed to get members/bots
+intents.presences = True    # needed for presence (online/offline)
 intents.guilds = True
 
 
 class StatusWatcher(discord.Client):
     def __init__(self, **kwargs):
         super().__init__(intents=intents, **kwargs)
-        # نخزن آخر حالة لكل بوت
-        self.last_status = {}
-        self.session = None
+        # store last known status for each monitored bot
+        self.last_status: dict[int, str] = {}
+        self.session: aiohttp.ClientSession | None = None
 
     async def setup_hook(self):
-        # Session للويبهوك
+        # HTTP session for webhook
         self.session = aiohttp.ClientSession()
-        # نبدأ اللوب بعد ما البوت يجهز
+        # start the monitoring loop after the bot is ready
         self.check_status_loop.start()
 
     async def on_ready(self):
         log.info(f"✅ Logged in as {self.user} (ID: {self.user.id})")
         log.info(f"Monitoring bots: {MONITORED_BOT_IDS}")
+
         guild = self.get_guild(GUILD_ID)
         if guild is None:
             log.warning(f"⚠️ Bot is not in guild {GUILD_ID}")
@@ -83,17 +79,22 @@ class StatusWatcher(discord.Client):
             log.info(f"✅ Connected to guild: {guild.name} ({guild.id})")
 
         channel = self.get_channel(STATUS_CHANNEL_ID)
-        if channel:
-            await channel.send("✅ **Status watcher bot started.**")
+        if isinstance(channel, discord.TextChannel):
+            embed = discord.Embed(
+                title="Status Watcher Online",
+                description="✅ Status watcher bot started and is now monitoring configured bots.",
+                color=discord.Color.green(),
+            )
+            embed.set_footer(text="Status Watcher")
+            await channel.send(embed=embed)
 
     async def close(self):
-        # نغلق جلسة الويبهوك
         if self.session:
             await self.session.close()
         await super().close()
 
     # --------------------------
-    # لوب المراقبة
+    # Monitoring loop
     # --------------------------
     @tasks.loop(seconds=CHECK_INTERVAL)
     async def check_status_loop(self):
@@ -103,32 +104,33 @@ class StatusWatcher(discord.Client):
             return
 
         channel = self.get_channel(STATUS_CHANNEL_ID)
-        if channel is None:
+        if not isinstance(channel, discord.TextChannel):
             log.warning("Status channel not found, skipping messages.")
             return
 
         for bot_id in MONITORED_BOT_IDS:
             member = guild.get_member(bot_id)
+
             if member is None:
-                # البوت مش في السيرفر أو مش متشاف
+                # bot is not in guild or not visible
                 current_status = "not_in_guild"
             else:
-                # status ممكن يكون online / offline / idle / dnd / invisible
-                current_status = str(member.status)  # تحويل لنص
+                # online / offline / idle / dnd / invisible
+                current_status = str(member.status)
 
             previous_status = self.last_status.get(bot_id)
 
-            # أول مرة نشوفه → بس نخزن الحالة
+            # first time we see this bot -> just store the status
             if previous_status is None:
                 self.last_status[bot_id] = current_status
                 log.info(f"Initial status for {bot_id}: {current_status}")
                 continue
 
-            # لو مفيش تغيير → skip
+            # no change
             if current_status == previous_status:
                 continue
 
-            # حصل تغيير
+            # there is a change
             self.last_status[bot_id] = current_status
             await self.handle_status_change(
                 channel, bot_id, previous_status, current_status
@@ -140,7 +142,7 @@ class StatusWatcher(discord.Client):
         log.info("Starting status check loop...")
 
     # --------------------------
-    # إرسال الرسائل عند التغيير
+    # Handle status changes
     # --------------------------
     async def handle_status_change(
         self,
@@ -151,47 +153,76 @@ class StatusWatcher(discord.Client):
     ):
         bot_mention = f"<@{bot_id}>"
 
-        # هنعتبر كل الحالات غير offline = Online
-        is_now_offline = (
-            new_status == "offline"
-            or new_status == "invisible"
-            or new_status == "not_in_guild"
-        )
-        was_offline = (
-            old_status == "offline"
-            or old_status == "invisible"
-            or old_status == "not_in_guild"
-        )
+        def pretty_status(status: str) -> str:
+            if status == "not_in_guild":
+                return "Not in guild / unreachable"
+            return status.capitalize()
 
-        # لو بقى Online بعد ما كان Offline
+        # consider anything that is not offline as "online-ish"
+        is_now_offline = new_status in ("offline", "invisible", "not_in_guild")
+        was_offline = old_status in ("offline", "invisible", "not_in_guild")
+
+        # choose style depending on transition
         if not is_now_offline and was_offline:
-            msg = f"🟢 البوت {bot_mention} رجع **Online** (الحالة الجديدة: `{new_status}`)."
-        # لو بقى Offline
-        elif is_now_offline and not was_offline:
-            admin_mentions = (
-                " ".join(f"<@{admin_id}>" for admin_id in ADMIN_IDS)
-                if ADMIN_IDS
-                else ""
+            # went ONLINE
+            title = "Bot is back online"
+            emoji = "🟢"
+            color = discord.Color.green()
+            description = (
+                f"{emoji} {bot_mention} is now **Online**.\n"
+                f"New status: `{pretty_status(new_status)}`"
             )
-            msg = (
-                f"🔴 البوت {bot_mention} بقى **Offline/Sleep** "
-                f"(الحالة الجديدة: `{new_status}`). {admin_mentions}".strip()
+        elif is_now_offline and not was_offline:
+            # went OFFLINE
+            title = "Bot went offline"
+            emoji = "🔴"
+            color = discord.Color.red()
+            description = (
+                f"{emoji} {bot_mention} is now **Offline / Sleeping**.\n"
+                f"New status: `{pretty_status(new_status)}`"
             )
         else:
-            # تغيير بين idle/dnd/online → نكتب رسالة أبسط
-            msg = (
-                f"ℹ️ حالة البوت {bot_mention} اتغيرت من `{old_status}` "
-                f"إلى `{new_status}`."
+            # other transitions (idle <-> dnd <-> online)
+            title = "Bot status changed"
+            emoji = "🟡"
+            color = discord.Color.yellow()
+            description = (
+                f"{emoji} {bot_mention} changed status.\n"
+                f"Old: `{pretty_status(old_status)}` → New: `{pretty_status(new_status)}`"
             )
 
-        log.info(msg)
-        # إرسال للقناة
-        await channel.send(msg)
+        # log
+        log.info(f"{title}: {bot_mention} {old_status} -> {new_status}")
 
-        # إرسال كمان للويبهوك (اختياري)
-        if WEBHOOK_URL:
+        # create embed
+        embed = discord.Embed(
+            title=title,
+            description=description,
+            color=color,
+        )
+        embed.add_field(
+            name="Previous status",
+            value=f"`{pretty_status(old_status)}`",
+            inline=True,
+        )
+        embed.add_field(
+            name="Current status",
+            value=f"`{pretty_status(new_status)}`",
+            inline=True,
+        )
+        embed.set_footer(text="Status Watcher")
+
+        # send to Discord channel
+        await channel.send(embed=embed)
+
+        # also send a simple text line to the webhook (optional)
+        if WEBHOOK_URL and self.session:
             try:
-                payload = {"content": msg, "allowed_mentions": {"parse": ["users"]}}
+                webhook_message = f"{emoji} {bot_mention} status changed: `{old_status}` → `{new_status}`"
+                payload = {
+                    "content": webhook_message,
+                    "allowed_mentions": {"parse": ["users"]},
+                }
                 async with self.session.post(WEBHOOK_URL, json=payload) as resp:
                     if resp.status >= 400:
                         text = await resp.text()
@@ -201,7 +232,7 @@ class StatusWatcher(discord.Client):
 
 
 # --------------------------
-# تشغيل البوت
+# Run the bot
 # --------------------------
 def main():
     client = StatusWatcher()
