@@ -140,6 +140,8 @@ class StatusWatcher(discord.Client):
         - skip bots
         - skip admins
         - skip members with IGNORE_ROLE_NAMES
+        - avoid duplicates by tagging rooms with user_id in the topic
+        - إذا كانت له غرفة قديمة بدون topic → نضيف الـ topic ونمنع إنشاء غرفة جديدة
         """
         # skip bots
         if member.bot:
@@ -154,8 +156,53 @@ class StatusWatcher(discord.Client):
         if member_role_names & IGNORE_ROLE_NAMES:
             return False
 
-        # compute channel name
-        channel_name = self.make_channel_name(member)
+        topic_tag = f"ss-room-user:{member.id}"
+
+        # 1) لو فيه قناة متعلّم عليها بالـ topic tag بالفعل
+        for ch in category.channels:
+            if not isinstance(ch, discord.TextChannel):
+                continue
+            if ch.topic and topic_tag in ch.topic:
+                # العضو عنده غرفة بالفعل
+                return False
+
+        # 2) لو فيه غرفة قديمة (بدون topic) لكن العضو عضو فيها
+        existing_room_for_member = None
+        for ch in category.channels:
+            if not isinstance(ch, discord.TextChannel):
+                continue
+            if member in ch.members:
+                existing_room_for_member = ch
+                break
+
+        if existing_room_for_member is not None:
+            # أضف / حدّث الـ topic بدل ما نعمل غرفة جديدة
+            try:
+                old_topic = existing_room_for_member.topic or ""
+                if topic_tag not in old_topic:
+                    new_topic = (old_topic + " " + topic_tag).strip()
+                    await existing_room_for_member.edit(
+                        topic=new_topic,
+                        reason="Tag existing SS room with user id instead of creating duplicate.",
+                    )
+                    log.info(
+                        f"Tagged existing room '{existing_room_for_member.name}' for {member} ({member.id})"
+                    )
+            except Exception as e:
+                log.exception(
+                    f"Failed to tag existing room for {member} ({member.id}): {e}"
+                )
+                await self.send_log_message(
+                    f"Failed to tag existing room for {member} ({member.id}): {e}"
+                )
+
+            # في الحالتين (سواء التاج ظبط أو لأ) ما نعملش غرفة جديدة
+            return False
+
+        # 3) مفيش غرفة أصلاً → نبدأ ننشئ واحدة جديدة
+        base = member.display_name.strip() or f"user-{member.id}"
+        channel_name = base.replace(" ", "-").lower()
+        channel_name = channel_name[:90]
 
         if existing_names is None:
             existing_names = {
@@ -164,9 +211,12 @@ class StatusWatcher(discord.Client):
                 if isinstance(ch, discord.TextChannel)
             }
 
-        # already has a room with this name
-        if channel_name in existing_names:
-            return False
+        # لو الاسم متكرر مع حد تاني → نزوّد suffix -2, -3, ...
+        original = channel_name
+        i = 2
+        while channel_name in existing_names:
+            channel_name = f"{original}-{i}"
+            i += 1
 
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -182,7 +232,6 @@ class StatusWatcher(discord.Client):
             ),
         }
 
-        # SS role (if exists)
         ss_role = discord.utils.get(guild.roles, name=SS_ROLE_NAME)
 
         try:
@@ -190,6 +239,7 @@ class StatusWatcher(discord.Client):
                 name=channel_name,
                 overwrites=overwrites,
                 reason="Auto-create personal room for bot usage",
+                topic=f"غرفتك الخاصة لاستخدام بوت الـ OCR (ss-room-user:{member.id})",
             )
             existing_names.add(channel.name)
             self.room_creation_times.append(time.time())
@@ -208,7 +258,7 @@ class StatusWatcher(discord.Client):
                         f"Failed to add SS role to {member} ({member.id}): {e}"
                     )
 
-            # send welcome / commands
+            # send welcome / commands + قنوات الخطأ والاقتراحات
             await channel.send(
                 f"Hi {member.mention}! 👋\n\n"
                 "This is your personal channel to use the OCR bots.\n\n"
@@ -216,6 +266,9 @@ class StatusWatcher(discord.Client):
                 "• `/clean` – clean pages.\n"
                 "• `/extract` – extract text with OCR.\n"
                 "• `/translate` – translate extracted text.\n"
+                "\n"
+                "If you face any error, please write it in <#1442921463475601564>.\n"
+                "If you have any suggestion, please write it in <#1441555038169333811>.\n"
             )
 
             log.info(f"Created personal room '{channel.name}' for {member} ({member.id})")
@@ -330,8 +383,8 @@ class StatusWatcher(discord.Client):
             await message.channel.send(embed=embed)
             return
 
-        # ----------------- /room -----------------
-        if content in ("/room", "!room", "room"):
+        # ----------------- $room -----------------
+        if content == "$room":
             category = self.get_channel(SS_CLASS_CATEGORY_ID)
             if not isinstance(category, discord.CategoryChannel):
                 await message.channel.send(
@@ -342,7 +395,7 @@ class StatusWatcher(discord.Client):
             # Admin: trigger full scan immediately
             if message.author.guild_permissions.administrator:
                 await message.channel.send(
-                    "🛠 Running full room scan now (admin-triggered `/room`)."
+                    "🛠 Running full room scan now (admin-triggered `$room`)."
                 )
 
                 existing_names = {
