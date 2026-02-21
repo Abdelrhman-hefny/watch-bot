@@ -383,9 +383,7 @@ async def restart_cmd(ctx: commands.Context, target: discord.Member = None):
     bot.global_restart_until = float(end_ts)
 
     await ctx.send(
-        "🔄 Restart request sent.\n"
-        f"🎯 Target: {target_mention}\n"
-        f"⏳ Expected finish: <t:{end_ts}:R>"
+        f"🔄 Expected restart in <t:{end_ts}:R>"
     )
 
 
