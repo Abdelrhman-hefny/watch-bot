@@ -1,12 +1,12 @@
 import time
 import logging
 from pathlib import Path
-from datetime import timedelta
 import os
 import asyncio
+import json
 
 import discord
-from discord.ext import tasks
+from discord.ext import commands
 from dotenv import load_dotenv
 import aiohttp
 
@@ -92,37 +92,35 @@ intents.guilds = True
 intents.message_content = True  # needed to read text commands
 
 
-class StatusWatcher(discord.Client):
-    def __init__(self, **kwargs):
-        super().__init__(intents=intents, **kwargs)
-        # store last known status for each monitored bot
-        self.last_status: dict[int, str] = {}
-        # store last time each user used /watch (cooldown)
-        self.watch_cooldown: dict[int, float] = {}
-        # store last time each user used !restart (cooldown)
-        self.restart_cooldown: dict[int, float] = {}
-        # global anti-spam: timestamp until which restart is considered active
-        self.global_restart_until: float = 0.0
+STATUS_CACHE_PATH = Path(__file__).parent / "last_status.json"
 
-    # --------------------------------
-    # Helpers
-    # --------------------------------
-    @staticmethod
-    def make_channel_name(member: discord.Member) -> str:
-        """
-        Build a channel name from member.display_name.
-        Use display name (nickname) not the global username.
-        """
-        base = member.display_name.strip()
-        if not base:
-            base = f"user-{member.id}"
-        # spaces -> hyphens, lower for consistency
-        name = base.replace(" ", "-").lower()
-        # Discord limit ~100 chars, keep it shorter
-        return name[:90]
+
+class StatusWatcherBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix=("!", "/"), intents=intents)
+        self.last_status: dict[int, str] = {}
+        self.global_restart_until: float = 0.0
+        self._load_last_status()
+
+    def _load_last_status(self):
+        try:
+            if STATUS_CACHE_PATH.exists():
+                data = json.loads(STATUS_CACHE_PATH.read_text(encoding="utf-8") or "{}")
+                if isinstance(data, dict):
+                    self.last_status = {int(k): str(v) for k, v in data.items()}
+        except Exception as e:
+            log.exception(f"Failed to load last_status cache: {e}")
+
+    def _save_last_status(self):
+        try:
+            STATUS_CACHE_PATH.write_text(
+                json.dumps(self.last_status, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            log.exception(f"Failed to save last_status cache: {e}")
 
     async def send_log_message(self, text: str):
-        """Send important error/info to a dedicated log channel if configured."""
         if LOG_CHANNEL_ID == 0:
             return
         channel = self.get_channel(LOG_CHANNEL_ID)
@@ -135,7 +133,7 @@ class StatusWatcher(discord.Client):
     async def send_restart_webhook(self) -> bool:
         if not RESTART_WEBHOOK_URL:
             await self.send_log_message(
-                "RESTART_WEBHOOK_URL is not set; !restart webhook message was skipped."
+                "RESTART_WEBHOOK_URL is not set; restart webhook message was skipped."
             )
             return False
 
@@ -158,262 +156,20 @@ class StatusWatcher(discord.Client):
             await self.send_log_message(f"Failed to send restart webhook: {e}")
             return False
 
-    async def restart_countdown(self, message: discord.Message, end_ts: int):
-        try:
-            await message.channel.send(
-                "🔄 تم إرسال طلب إعادة التشغيل.\n"
-                f"⏳ المتوقع الانتهاء: <t:{end_ts}:R>\n"
-                f"{message.author.mention} من فضلك استنى لحد الوقت ده قبل ما تستخدم `!restart` تاني."
-            )
-        except Exception as e:
-            log.exception(f"Failed to send countdown message: {e}")
-            await self.send_log_message(f"Failed to send countdown message: {e}")
-            return
-
-    # --------------------------------
-    # Events
-    # --------------------------------
-    async def on_ready(self):
-        log.info(f"✅ Logged in as {self.user} (ID: {self.user.id})")
-        log.info(f"Monitoring bots: {MONITORED_BOT_IDS}")
-
-        guild = self.get_guild(GUILD_ID)
-        if guild is None:
-            log.warning(f"⚠️ Bot is not in guild {GUILD_ID}")
-        else:
-            log.info(f"✅ Connected to guild: {guild.name} ({guild.id})")
-
-        channel = self.get_channel(STATUS_CHANNEL_ID)
-        if isinstance(channel, discord.TextChannel):
-            embed = discord.Embed(
-                title="Status Watcher Online",
-                description="✅ Status watcher bot started and is now monitoring configured bots.",
-                color=discord.Color.green(),
-            )
-            embed.set_footer(text="Status Watcher")
-            await channel.send(embed=embed)
-
-        # start background loops if not already running
-        if not self.check_status_loop.is_running():
-            self.check_status_loop.start()
-
-    async def on_message(self, message: discord.Message):
-        # ignore bots (including this watcher)
-        if message.author.bot:
-            return
-
-        content_raw = message.content.strip()
-        content = content_raw.lower()
-
-        guild = self.get_guild(GUILD_ID) or message.guild
-        if guild is None:
-            return
-
-        # ----------------- /watch (with cooldown) -----------------
-        if content in ("/watch", "!watch", "watch"):
-            now = time.time()
-            last = self.watch_cooldown.get(message.author.id, 0)
-            if now - last < 10:  # 10 seconds cooldown
-                remaining = int(10 - (now - last))
-                await message.channel.send(
-                    f"⏳ Please wait {remaining} more second(s) before using `/watch` again."
-                )
-                return
-            self.watch_cooldown[message.author.id] = now
-
-            if not MONITORED_BOT_IDS:
-                await message.channel.send("ℹ️ No monitored bots are configured.")
-                return
-
-            offline_states = {"offline", "invisible", "not_in_guild"}
-
-            embed = discord.Embed(
-                title="Monitored Bots Status",
-                description="Current presence for all configured bots:",
-                color=discord.Color.blurple(),
-            )
-            embed.set_footer(text="Status Watcher • /watch")
-
-            for bot_id in MONITORED_BOT_IDS:
-                member = guild.get_member(bot_id)
-
-                if member is None:
-                    current_status = "not_in_guild"
-                else:
-                    current_status = str(member.status)
-
-                if current_status in offline_states:
-                    label = "Offline / Sleeping"
-                    emoji = "🔴"
-                elif current_status == "online":
-                    label = "Online"
-                    emoji = "🟢"
-                elif current_status == "idle":
-                    label = "Idle"
-                    emoji = "🌙"
-                elif current_status == "dnd":
-                    label = "Do Not Disturb"
-                    emoji = "⛔"
-                else:
-                    label = current_status.capitalize()
-                    emoji = "❔"
-
-                bot_mention = f"<@{bot_id}>"
-                embed.add_field(
-                    name=bot_mention,
-                    value=f"{emoji} **{label}** (`{current_status}`)",
-                    inline=False,
-                )
-
-            await message.channel.send(embed=embed)
-            return
-
-        # ----------------- !restart (webhook + lightweight countdown) -----------------
-        if content == "!restart":
-            now = time.time()
-
-            if now < self.global_restart_until:
-                await message.channel.send(
-                    "⚠️ فيه Restart شغال بالفعل.\n"
-                    f"⏳ المتوقع الانتهاء: <t:{int(self.global_restart_until)}:R>"
-                )
-                return
-
-            last = self.restart_cooldown.get(message.author.id, 0)
-            if now - last < 5 * 60:
-                await message.channel.send(
-                    f"⏳ {message.author.mention} you already requested a restart. Please wait a bit."
-                )
-                return
-
-            ok = await self.send_restart_webhook()
-            if not ok:
-                await message.channel.send(
-                    "⚠️ حصلت مشكلة وأنا ببعت طلب الـ Restart. جرّب تاني بعد شوية."
-                )
-                return
-
-            end_ts = int(now) + 5 * 60
-            self.global_restart_until = float(end_ts)
-            self.restart_cooldown[message.author.id] = now
-
-            await self.restart_countdown(message, end_ts)
-            return
-
-        # ----------------- /bot-status (admins only) -----------------
-        if content in ("/bot-status", "!bot-status", "bot-status"):
-            if not message.author.guild_permissions.administrator:
-                await message.channel.send(
-                    "⛔ This command is for admins only."
-                )
-                return
-
-            embed = discord.Embed(
-                title="Bot Status Summary",
-                color=discord.Color.gold(),
-            )
-
-            offline_states = {"offline", "invisible", "not_in_guild"}
-            offline_list = []
-            online_list = []
-
-            for bot_id in MONITORED_BOT_IDS:
-                member = guild.get_member(bot_id)
-                if member is None:
-                    current_status = "not_in_guild"
-                else:
-                    current_status = str(member.status)
-
-                mention = f"<@{bot_id}>"
-                if current_status in offline_states:
-                    offline_list.append(f"{mention} (`{current_status}`)")
-                else:
-                    online_list.append(f"{mention} (`{current_status}`)")
-
-            embed.add_field(
-                name="Online Bots",
-                value="\n".join(online_list) if online_list else "None",
-                inline=False,
-            )
-            embed.add_field(
-                name="Offline Bots / Not reachable",
-                value="\n".join(offline_list) if offline_list else "None",
-                inline=False,
-            )
-
-            await message.channel.send(embed=embed)
-            return
-
-    # --------------------------
-    # Monitoring loop for bots
-    # --------------------------
-    @tasks.loop(seconds=CHECK_INTERVAL)
-    async def check_status_loop(self):
-        guild = self.get_guild(GUILD_ID)
-        if guild is None:
-            log.warning("Guild not found, skipping bot status check cycle.")
-            return
-
-        channel = self.get_channel(STATUS_CHANNEL_ID)
-        if not isinstance(channel, discord.TextChannel):
-            log.warning("Status channel not found, skipping bot status messages.")
-            return
-
-        offline_states = {"offline", "invisible", "not_in_guild"}
-
-        for bot_id in MONITORED_BOT_IDS:
-            member = guild.get_member(bot_id)
-
-            if member is None:
-                # bot is not in guild or not visible
-                current_status = "not_in_guild"
-            else:
-                # online / offline / idle / dnd / invisible
-                current_status = str(member.status)
-
-            previous_status = self.last_status.get(bot_id)
-
-            # first time we see this bot -> just store the status
-            if previous_status is None:
-                self.last_status[bot_id] = current_status
-                log.info(f"Initial status for {bot_id}: {current_status}")
-                continue
-
-            # no change
-            if current_status == previous_status:
-                continue
-
-            # there is a change
-            self.last_status[bot_id] = current_status
-            await self.handle_status_change(
-                channel, bot_id, previous_status, current_status, offline_states
-            )
-
-    @check_status_loop.before_loop
-    async def before_check_status_loop(self):
-        await self.wait_until_ready()
-        log.info("Starting bot status check loop...")
-
-    # --------------------------
-    # Handle status changes
-    # --------------------------
     async def handle_status_change(
         self,
         channel: discord.TextChannel,
         bot_id: int,
         old_status: str,
         new_status: str,
-        offline_states: set,
+        offline_states: set[str],
     ):
         bot_mention = f"<@{bot_id}>"
-
         is_now_offline = new_status in offline_states
         was_offline = old_status in offline_states
 
-        # Went ONLINE
         if not is_now_offline and was_offline:
             log.info(f"Bot {bot_id} went ONLINE: {old_status} -> {new_status}")
-
             embed = discord.Embed(
                 title="Bot Online",
                 description=f"🟢 {bot_mention} is now **Online**.",
@@ -421,48 +177,279 @@ class StatusWatcher(discord.Client):
             )
             embed.set_footer(text="Status Watcher")
             await channel.send(embed=embed)
+            return
 
-        # Went OFFLINE
-        elif is_now_offline and not was_offline:
+        if is_now_offline and not was_offline:
             log.info(f"Bot {bot_id} went OFFLINE: {old_status} -> {new_status}")
 
-            # build admin mentions (if configured)
             admin_mentions = (
                 " ".join(f"<@{admin_id}>" for admin_id in ADMIN_IDS)
                 if ADMIN_IDS
                 else ""
             ).strip()
 
-            # content (outside embed) → this will actually ping
             if admin_mentions:
                 content = f"{admin_mentions} 🔴 {bot_mention} is now **Offline / Sleeping**."
             else:
                 content = f"🔴 {bot_mention} is now **Offline / Sleeping**."
 
-            # embed just for nice formatting (no need ل mentions جوه الوصف)
             embed = discord.Embed(
                 title="Bot Offline",
                 description="A monitored bot just went offline.",
                 color=discord.Color.red(),
             )
             embed.set_footer(text="Status Watcher")
-
             await channel.send(content=content, embed=embed)
-
-        # Other transitions (idle/dnd/online<->idle) are ignored
-        else:
-            log.info(
-                f"Ignored minor state change: {bot_id} {old_status} -> {new_status}"
-            )
             return
+
+        log.info(f"Ignored minor state change: {bot_id} {old_status} -> {new_status}")
+
+
+bot = StatusWatcherBot()
+
+
+@bot.event
+async def on_ready():
+    log.info(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
+    log.info(f"Monitoring bots: {MONITORED_BOT_IDS}")
+
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        log.warning(f"⚠️ Bot is not in guild {GUILD_ID}")
+    else:
+        log.info(f"✅ Connected to guild: {guild.name} ({guild.id})")
+
+    channel = bot.get_channel(STATUS_CHANNEL_ID)
+    if isinstance(channel, discord.TextChannel):
+        embed = discord.Embed(
+            title="Status Watcher Online",
+            description="✅ Status watcher bot started and is now monitoring configured bots.",
+            color=discord.Color.green(),
+        )
+        embed.set_footer(text="Status Watcher")
+        await channel.send(embed=embed)
+
+    if guild is not None:
+        for bot_id in MONITORED_BOT_IDS:
+            member = guild.get_member(bot_id)
+            current_status = "not_in_guild" if member is None else str(member.status)
+            if bot.last_status.get(bot_id) is None:
+                bot.last_status[bot_id] = current_status
+        bot._save_last_status()
+
+
+@bot.event
+async def on_presence_update(before: discord.Member, after: discord.Member):
+    if after.guild is None or after.guild.id != GUILD_ID:
+        return
+    if after.id not in MONITORED_BOT_IDS:
+        return
+
+    channel = bot.get_channel(STATUS_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    offline_states = {"offline", "invisible", "not_in_guild"}
+
+    old_status = bot.last_status.get(after.id)
+    new_status = str(after.status)
+
+    if old_status is None:
+        bot.last_status[after.id] = new_status
+        bot._save_last_status()
+        return
+
+    if new_status == old_status:
+        return
+
+    bot.last_status[after.id] = new_status
+    bot._save_last_status()
+    await bot.handle_status_change(channel, after.id, old_status, new_status, offline_states)
+
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    if member.guild is None or member.guild.id != GUILD_ID:
+        return
+    if member.id not in MONITORED_BOT_IDS:
+        return
+
+    bot.last_status[member.id] = "not_in_guild"
+    bot._save_last_status()
+    await bot.send_log_message(f"Monitored bot removed from guild: {member} ({member.id})")
+
+
+@bot.command(name="watch")
+@commands.cooldown(1, 10, commands.BucketType.user)
+async def watch_cmd(ctx: commands.Context):
+    guild = bot.get_guild(GUILD_ID) or ctx.guild
+    if guild is None:
+        return
+
+    if not MONITORED_BOT_IDS:
+        await ctx.send("ℹ️ No monitored bots are configured.")
+        return
+
+    offline_states = {"offline", "invisible", "not_in_guild"}
+
+    embed = discord.Embed(
+        title="Monitored Bots Status",
+        description="Current presence for all configured bots:",
+        color=discord.Color.blurple(),
+    )
+    embed.set_footer(text="Status Watcher • watch")
+
+    for bot_id in MONITORED_BOT_IDS:
+        member = guild.get_member(bot_id)
+        current_status = "not_in_guild" if member is None else str(member.status)
+
+        if current_status in offline_states:
+            label = "Offline / Sleeping"
+            emoji = "🔴"
+        elif current_status == "online":
+            label = "Online"
+            emoji = "🟢"
+        elif current_status == "idle":
+            label = "Idle"
+            emoji = "🌙"
+        elif current_status == "dnd":
+            label = "Do Not Disturb"
+            emoji = "⛔"
+        else:
+            label = current_status.capitalize()
+            emoji = "❔"
+
+        bot_mention = f"<@{bot_id}>"
+        embed.add_field(
+            name=bot_mention,
+            value=f"{emoji} **{label}** (`{current_status}`)",
+            inline=False,
+        )
+
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="bot-status")
+@commands.has_permissions(administrator=True)
+async def bot_status_cmd(ctx: commands.Context):
+    guild = bot.get_guild(GUILD_ID) or ctx.guild
+    if guild is None:
+        return
+
+    embed = discord.Embed(
+        title="Bot Status Summary",
+        color=discord.Color.gold(),
+    )
+
+    offline_states = {"offline", "invisible", "not_in_guild"}
+    offline_list = []
+    online_list = []
+
+    for bot_id in MONITORED_BOT_IDS:
+        member = guild.get_member(bot_id)
+        current_status = "not_in_guild" if member is None else str(member.status)
+        mention = f"<@{bot_id}>"
+        if current_status in offline_states:
+            offline_list.append(f"{mention} (`{current_status}`)")
+        else:
+            online_list.append(f"{mention} (`{current_status}`)")
+
+    embed.add_field(
+        name="Online Bots",
+        value="\n".join(online_list) if online_list else "None",
+        inline=False,
+    )
+    embed.add_field(
+        name="Offline Bots / Not reachable",
+        value="\n".join(offline_list) if offline_list else "None",
+        inline=False,
+    )
+
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="restart")
+@commands.cooldown(1, 5 * 60, commands.BucketType.user)
+async def restart_cmd(ctx: commands.Context):
+    now = time.time()
+
+    if now < bot.global_restart_until:
+        msg = await ctx.send(
+            "⚠️ فيه Restart شغال بالفعل.\n"
+            f"⏳ المتوقع الانتهاء: <t:{int(bot.global_restart_until)}:R>"
+        )
+        try:
+            await ctx.message.delete(delay=30)
+        except Exception:
+            pass
+        try:
+            await msg.delete(delay=30)
+        except Exception:
+            pass
+        return
+
+    ok = await bot.send_restart_webhook()
+    if not ok:
+        ctx.command.reset_cooldown(ctx)
+        msg = await ctx.send("⚠️ حصلت مشكلة وأنا ببعت طلب الـ Restart. جرّب تاني بعد شوية.")
+        try:
+            await ctx.message.delete(delay=30)
+        except Exception:
+            pass
+        try:
+            await msg.delete(delay=30)
+        except Exception:
+            pass
+        return
+
+    end_ts = int(now) + 5 * 60
+    bot.global_restart_until = float(end_ts)
+
+    msg = await ctx.send(
+        "🔄 تم إرسال طلب إعادة التشغيل.\n"
+        f"⏳ المتوقع الانتهاء: <t:{end_ts}:R>\n"
+        f"{ctx.author.mention} من فضلك استنى لحد الوقت ده قبل ما تستخدم `!restart` تاني."
+    )
+
+    try:
+        await ctx.message.delete(delay=30)
+    except Exception:
+        pass
+    try:
+        await msg.delete(delay=30)
+    except Exception:
+        pass
+
+
+@watch_cmd.error
+async def watch_cmd_error(ctx: commands.Context, error: Exception):
+    if isinstance(error, commands.CommandOnCooldown):
+        await ctx.send(f"⏳ استنى {int(error.retry_after)} ثانية قبل ما تستخدم الأمر تاني.")
+        return
+    raise error
+
+
+@restart_cmd.error
+async def restart_cmd_error(ctx: commands.Context, error: Exception):
+    if isinstance(error, commands.CommandOnCooldown):
+        await ctx.send(f"⏳ استنى {int(error.retry_after)} ثانية قبل ما تستخدم الأمر تاني.")
+        return
+    raise error
+
+
+@bot_status_cmd.error
+async def bot_status_cmd_error(ctx: commands.Context, error: Exception):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("⛔ This command is for admins only.")
+        return
+    raise error
 
 
 # --------------------------
 # Run the bot
 # --------------------------
 def main():
-    client = StatusWatcher()
-    client.run(DISCORD_TOKEN)
+    bot.run(DISCORD_TOKEN)
 
 
 if __name__ == "__main__":
