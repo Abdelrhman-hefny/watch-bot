@@ -2,7 +2,6 @@ import time
 import logging
 from pathlib import Path
 import os
-import asyncio
 import json
 
 import discord
@@ -38,28 +37,6 @@ STATUS_CHANNEL_ID = int(os.getenv("STATUS_CHANNEL_ID", "0"))
 MONITORED_BOT_IDS = [
     int(x.strip()) for x in os.getenv("MONITORED_BOT_IDS", "").split(",") if x.strip()
 ]
-
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "30"))
-
-# Category for per-user rooms (SS-Class)
-SS_CLASS_CATEGORY_ID = int(os.getenv("SS_CLASS_CATEGORY_ID", "1442883219971375321"))
-
-# Archive category for old rooms
-SS_ARCHIVE_CATEGORY_ID = int(os.getenv("SS_ARCHIVE_CATEGORY_ID", "0"))
-
-# Role names that should be IGNORED when creating rooms (typically admins/bots helpers)
-IGNORE_ROLE_NAMES = {"L", "bot"}
-
-# Role name to give to users when a room is created
-SS_ROLE_NAME = os.getenv("SS_ROLE_NAME", "SS")
-
-# Interval (hours) for user-room check
-USER_ROOM_CHECK_INTERVAL_HOURS = int(
-    os.getenv("USER_ROOM_CHECK_INTERVAL_HOURS", "12")
-)
-
-# How many days of inactivity before archiving a room
-ARCHIVE_INACTIVE_DAYS = int(os.getenv("ARCHIVE_INACTIVE_DAYS", "10"))
 
 # Log channel for important errors
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
@@ -385,14 +362,10 @@ async def restart_cmd(ctx: commands.Context, target: discord.Member = None):
     )
 
     if now < bot.global_restart_until:
-        msg = await ctx.send(
+        await ctx.send(
             "⚠️ A restart request is already in progress.\n"
             f"⏳ Expected finish: <t:{int(bot.global_restart_until)}:R>"
         )
-        try:
-            await ctx.message.delete(delay=30)
-        except Exception:
-            pass
         return
 
     ok = await bot.send_restart_webhook(
@@ -401,29 +374,19 @@ async def restart_cmd(ctx: commands.Context, target: discord.Member = None):
     )
     if not ok:
         ctx.command.reset_cooldown(ctx)
-        msg = await ctx.send(
+        await ctx.send(
             "⚠️ Failed to send the restart request (webhook error). Please try again later."
         )
-        try:
-            await ctx.message.delete(delay=30)
-        except Exception:
-            pass
         return
 
     end_ts = int(now) + 5 * 60
     bot.global_restart_until = float(end_ts)
 
-    msg = await ctx.send(
+    await ctx.send(
         "🔄 Restart request sent.\n"
         f"🎯 Target: {target_mention}\n"
-        f"⏳ Expected finish: <t:{end_ts}:R>\n"
-        f"{ctx.author.mention} please wait until then before using `!restart` again."
+        f"⏳ Expected finish: <t:{end_ts}:R>"
     )
-
-    try:
-        await ctx.message.delete(delay=30)
-    except Exception:
-        pass
 
 
 @watch_cmd.error
