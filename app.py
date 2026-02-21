@@ -3,10 +3,12 @@ import logging
 from pathlib import Path
 from datetime import timedelta
 import os
+import asyncio
 
 import discord
 from discord.ext import tasks
 from dotenv import load_dotenv
+import aiohttp
 
 # --------------------------
 # Logging setup
@@ -62,6 +64,8 @@ ARCHIVE_INACTIVE_DAYS = int(os.getenv("ARCHIVE_INACTIVE_DAYS", "10"))
 # Log channel for important errors
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
 
+RESTART_WEBHOOK_URL = "https://discord.com/api/webhooks/1468613841528033473/TUa9LqfYmb5msk0nwvu1ydZgv9e-67XauL7P7c4ple2vuao9Hj4D46qEa6byAC5gPDo6"
+
 # Admin IDs to mention when a monitored bot goes offline
 ADMIN_IDS = [
     int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()
@@ -95,8 +99,10 @@ class StatusWatcher(discord.Client):
         self.last_status: dict[int, str] = {}
         # store last time each user used /watch (cooldown)
         self.watch_cooldown: dict[int, float] = {}
-        # timestamps of room creations (for last 24h stats)
-        self.room_creation_times: list[float] = []
+        # store last time each user used !restart (cooldown)
+        self.restart_cooldown: dict[int, float] = {}
+        # global anti-spam: timestamp until which restart is considered active
+        self.global_restart_until: float = 0.0
 
     # --------------------------------
     # Helpers
@@ -126,160 +132,43 @@ class StatusWatcher(discord.Client):
             except Exception as e:
                 log.exception(f"Failed to send log message to log channel: {e}")
 
-    async def ensure_member_room(
-        self,
-        guild: discord.Guild,
-        category: discord.CategoryChannel,
-        member: discord.Member,
-        existing_names: set[str] | None = None,
-    ) -> bool:
-        """
-        Ensure that a given member has a personal room inside the given category.
-        Returns True if a room was created, False otherwise.
-        Applies all ignore rules:
-        - skip bots
-        - skip admins
-        - skip members with IGNORE_ROLE_NAMES
-        - avoid duplicates by tagging rooms with user_id in the topic
-        - إذا كانت له غرفة قديمة بدون topic → نضيف الـ topic ونمنع إنشاء غرفة جديدة
-        """
-        # skip bots
-        if member.bot:
+    async def send_restart_webhook(self) -> bool:
+        if not RESTART_WEBHOOK_URL:
+            await self.send_log_message(
+                "RESTART_WEBHOOK_URL is not set; !restart webhook message was skipped."
+            )
             return False
 
-        # skip admins
-        if member.guild_permissions.administrator:
-            return False
-
-        # skip members who have roles we want to ignore (L or bot)
-        member_role_names = {r.name for r in member.roles}
-        if member_role_names & IGNORE_ROLE_NAMES:
-            return False
-
-        topic_tag = f"ss-room-user:{member.id}"
-
-        # 1) لو فيه قناة متعلّم عليها بالـ topic tag بالفعل
-        for ch in category.channels:
-            if not isinstance(ch, discord.TextChannel):
-                continue
-            if ch.topic and topic_tag in ch.topic:
-                # العضو عنده غرفة بالفعل
-                return False
-
-        # 2) لو فيه غرفة قديمة (بدون topic) لكن العضو عضو فيها
-        existing_room_for_member = None
-        for ch in category.channels:
-            if not isinstance(ch, discord.TextChannel):
-                continue
-            if member in ch.members:
-                existing_room_for_member = ch
-                break
-
-        if existing_room_for_member is not None:
-            # أضف / حدّث الـ topic بدل ما نعمل غرفة جديدة
-            try:
-                old_topic = existing_room_for_member.topic or ""
-                if topic_tag not in old_topic:
-                    new_topic = (old_topic + " " + topic_tag).strip()
-                    await existing_room_for_member.edit(
-                        topic=new_topic,
-                        reason="Tag existing SS room with user id instead of creating duplicate.",
-                    )
-                    log.info(
-                        f"Tagged existing room '{existing_room_for_member.name}' for {member} ({member.id})"
-                    )
-            except Exception as e:
-                log.exception(
-                    f"Failed to tag existing room for {member} ({member.id}): {e}"
-                )
-                await self.send_log_message(
-                    f"Failed to tag existing room for {member} ({member.id}): {e}"
-                )
-
-            # في الحالتين (سواء التاج ظبط أو لأ) ما نعملش غرفة جديدة
-            return False
-
-        # 3) مفيش غرفة أصلاً → نبدأ ننشئ واحدة جديدة
-        base = member.display_name.strip() or f"user-{member.id}"
-        channel_name = base.replace(" ", "-").lower()
-        channel_name = channel_name[:90]
-
-        if existing_names is None:
-            existing_names = {
-                ch.name
-                for ch in category.channels
-                if isinstance(ch, discord.TextChannel)
-            }
-
-        # لو الاسم متكرر مع حد تاني → نزوّد suffix -2, -3, ...
-        original = channel_name
-        i = 2
-        while channel_name in existing_names:
-            channel_name = f"{original}-{i}"
-            i += 1
-
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            member: discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-            ),
-            guild.me: discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-            ),
+        bot_mention = self.user.mention if self.user else ""
+        payload = {
+            "content": f"restart {bot_mention}".strip(),
+            "allowed_mentions": {"parse": ["users", "roles", "everyone"]},
         }
 
-        ss_role = discord.utils.get(guild.roles, name=SS_ROLE_NAME)
-
         try:
-            channel = await category.create_text_channel(
-                name=channel_name,
-                overwrites=overwrites,
-                reason="Auto-create personal room for bot usage",
-                topic=f"غرفتك الخاصة لاستخدام بوت الـ OCR (ss-room-user:{member.id})",
-            )
-            existing_names.add(channel.name)
-            self.room_creation_times.append(time.time())
-
-            # give SS role if they don't already have it
-            if ss_role and ss_role not in member.roles:
-                try:
-                    await member.add_roles(
-                        ss_role, reason="Auto-assign SS role for personal room"
-                    )
-                except Exception as e:
-                    log.exception(
-                        f"Failed to add SS role to {member} ({member.id}): {e}"
-                    )
-                    await self.send_log_message(
-                        f"Failed to add SS role to {member} ({member.id}): {e}"
-                    )
-
-            # send welcome / commands + قنوات الخطأ والاقتراحات
-            await channel.send(
-                f"Hi {member.mention}! 👋\n\n"
-                "This is your personal channel to use the OCR bots.\n\n"
-                "**Useful commands:**\n"
-                "• `/clean` – clean pages.\n"
-                "• `/extract` – extract text with OCR.\n"
-                "• `/translate` – translate extracted text.\n"
-                "\n"
-                "If you face any error, please write it in <#1442921463475601564>.\n"
-                "If you have any suggestion, please write it in <#1441555038169333811>.\n"
-            )
-
-            log.info(f"Created personal room '{channel.name}' for {member} ({member.id})")
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(RESTART_WEBHOOK_URL, json=payload) as resp:
+                    if resp.status not in (200, 204):
+                        body = (await resp.text())[:1000]
+                        raise RuntimeError(f"Webhook HTTP {resp.status}: {body}")
             return True
-
         except Exception as e:
-            log.exception(f"Failed to create channel for {member} ({member.id}): {e}")
-            await self.send_log_message(
-                f"Failed to create channel for {member} ({member.id}): {e}"
-            )
+            log.exception(f"Failed to send restart webhook: {e}")
+            await self.send_log_message(f"Failed to send restart webhook: {e}")
             return False
+
+    async def restart_countdown(self, message: discord.Message, end_ts: int):
+        try:
+            await message.channel.send(
+                "🔄 تم إرسال طلب إعادة التشغيل.\n"
+                f"⏳ المتوقع الانتهاء: <t:{end_ts}:R>\n"
+                f"{message.author.mention} من فضلك استنى لحد الوقت ده قبل ما تستخدم `!restart` تاني."
+            )
+        except Exception as e:
+            log.exception(f"Failed to send countdown message: {e}")
+            await self.send_log_message(f"Failed to send countdown message: {e}")
+            return
 
     # --------------------------------
     # Events
@@ -307,10 +196,6 @@ class StatusWatcher(discord.Client):
         # start background loops if not already running
         if not self.check_status_loop.is_running():
             self.check_status_loop.start()
-        if not self.user_room_check_loop.is_running():
-            self.user_room_check_loop.start()
-        if not self.archive_old_rooms_loop.is_running():
-            self.archive_old_rooms_loop.start()
 
     async def on_message(self, message: discord.Message):
         # ignore bots (including this watcher)
@@ -383,55 +268,36 @@ class StatusWatcher(discord.Client):
             await message.channel.send(embed=embed)
             return
 
-        # ----------------- $room -----------------
-        if content == "$room":
-            category = self.get_channel(SS_CLASS_CATEGORY_ID)
-            if not isinstance(category, discord.CategoryChannel):
+        # ----------------- !restart (webhook + lightweight countdown) -----------------
+        if content == "!restart":
+            now = time.time()
+
+            if now < self.global_restart_until:
                 await message.channel.send(
-                    "⚠️ Room category is not configured correctly."
+                    "⚠️ فيه Restart شغال بالفعل.\n"
+                    f"⏳ المتوقع الانتهاء: <t:{int(self.global_restart_until)}:R>"
                 )
                 return
 
-            # Admin: trigger full scan immediately
-            if message.author.guild_permissions.administrator:
+            last = self.restart_cooldown.get(message.author.id, 0)
+            if now - last < 5 * 60:
                 await message.channel.send(
-                    "🛠 Running full room scan now (admin-triggered `$room`)."
+                    f"⏳ {message.author.mention} you already requested a restart. Please wait a bit."
                 )
+                return
 
-                existing_names = {
-                    ch.name
-                    for ch in category.channels
-                    if isinstance(ch, discord.TextChannel)
-                }
-                created_count = 0
-                for member in guild.members:
-                    created = await self.ensure_member_room(
-                        guild, category, member, existing_names
-                    )
-                    if created:
-                        created_count += 1
-
+            ok = await self.send_restart_webhook()
+            if not ok:
                 await message.channel.send(
-                    f"✅ Room scan finished. Created **{created_count}** new room(s)."
+                    "⚠️ حصلت مشكلة وأنا ببعت طلب الـ Restart. جرّب تاني بعد شوية."
                 )
-            else:
-                # Normal user: only ensure their own room
-                existing_names = {
-                    ch.name
-                    for ch in category.channels
-                    if isinstance(ch, discord.TextChannel)
-                }
-                created = await self.ensure_member_room(
-                    guild, category, message.author, existing_names
-                )
-                if created:
-                    await message.channel.send(
-                        "✅ Your personal room has been created under `SS-Class`."
-                    )
-                else:
-                    await message.channel.send(
-                        "ℹ️ You already have a room or you are not eligible for one."
-                    )
+                return
+
+            end_ts = int(now) + 5 * 60
+            self.global_restart_until = float(end_ts)
+            self.restart_cooldown[message.author.id] = now
+
+            await self.restart_countdown(message, end_ts)
             return
 
         # ----------------- /bot-status (admins only) -----------------
@@ -473,33 +339,6 @@ class StatusWatcher(discord.Client):
                 name="Offline Bots / Not reachable",
                 value="\n".join(offline_list) if offline_list else "None",
                 inline=False,
-            )
-
-            # SS-Class rooms count
-            ss_category = self.get_channel(SS_CLASS_CATEGORY_ID)
-            rooms_count = 0
-            if isinstance(ss_category, discord.CategoryChannel):
-                rooms_count = sum(
-                    1
-                    for ch in ss_category.channels
-                    if isinstance(ch, discord.TextChannel)
-                )
-
-            embed.add_field(
-                name="Current SS-Class rooms",
-                value=str(rooms_count),
-                inline=True,
-            )
-
-            # rooms created in last 24h
-            now = time.time()
-            last_24h = sum(
-                1 for t in self.room_creation_times if now - t <= 24 * 3600
-            )
-            embed.add_field(
-                name="Rooms created last 24h",
-                value=str(last_24h),
-                inline=True,
             )
 
             await message.channel.send(embed=embed)
@@ -616,146 +455,6 @@ class StatusWatcher(discord.Client):
                 f"Ignored minor state change: {bot_id} {old_status} -> {new_status}"
             )
             return
-
-    # --------------------------
-    # User room loop (every N hours)
-    # --------------------------
-    @tasks.loop(hours=USER_ROOM_CHECK_INTERVAL_HOURS)
-    async def user_room_check_loop(self):
-        await self.wait_until_ready()
-
-        guild = self.get_guild(GUILD_ID)
-        if guild is None:
-            log.warning("Guild not found, skipping user room check cycle.")
-            return
-
-        category = self.get_channel(SS_CLASS_CATEGORY_ID)
-        if not isinstance(category, discord.CategoryChannel):
-            log.warning(
-                f"Category with ID {SS_CLASS_CATEGORY_ID} not found or not a category."
-            )
-            return
-
-        existing_names = {
-            ch.name for ch in category.channels if isinstance(ch, discord.TextChannel)
-        }
-
-        created_count = 0
-
-        for member in guild.members:
-            created = await self.ensure_member_room(
-                guild, category, member, existing_names
-            )
-            if created:
-                created_count += 1
-
-        log.info(
-            f"User room check finished. Created {created_count} new channels in SS-Class."
-        )
-
-    @user_room_check_loop.before_loop
-    async def before_user_room_check_loop(self):
-        await self.wait_until_ready()
-        log.info(
-            f"Starting user room check loop every {USER_ROOM_CHECK_INTERVAL_HOURS} hours..."
-        )
-
-    # --------------------------
-    # Archive old rooms loop (daily)
-    # --------------------------
-    @tasks.loop(hours=24)
-    async def archive_old_rooms_loop(self):
-        await self.wait_until_ready()
-
-        if SS_ARCHIVE_CATEGORY_ID == 0:
-            # no archive category configured
-            return
-
-        guild = self.get_guild(GUILD_ID)
-        if guild is None:
-            log.warning("Guild not found, skipping archive check cycle.")
-            return
-
-        src_category = self.get_channel(SS_CLASS_CATEGORY_ID)
-        dst_category = self.get_channel(SS_ARCHIVE_CATEGORY_ID)
-
-        if not isinstance(src_category, discord.CategoryChannel):
-            log.warning(
-                f"Source category with ID {SS_CLASS_CATEGORY_ID} not found or not a category."
-            )
-            return
-        if not isinstance(dst_category, discord.CategoryChannel):
-            log.warning(
-                f"Archive category with ID {SS_ARCHIVE_CATEGORY_ID} not found or not a category."
-            )
-            return
-
-        now = discord.utils.utcnow()
-        threshold = now - timedelta(days=ARCHIVE_INACTIVE_DAYS)
-
-        archived_count = 0
-
-        for channel in src_category.channels:
-            if not isinstance(channel, discord.TextChannel):
-                continue
-
-            # get last message in channel
-            last_message = None
-            try:
-                async for msg in channel.history(limit=1, oldest_first=False):
-                    last_message = msg
-                    break
-            except Exception as e:
-                log.exception(
-                    f"Failed to fetch history for channel {channel.name} ({channel.id}): {e}"
-                )
-                await self.send_log_message(
-                    f"Failed to fetch history for channel {channel.name} ({channel.id}): {e}"
-                )
-                continue
-
-            if last_message is not None:
-                last_ts = last_message.created_at
-            else:
-                # no messages at all -> use channel creation time
-                last_ts = channel.created_at
-
-            if last_ts >= threshold:
-                # still active within last ARCHIVE_INACTIVE_DAYS
-                continue
-
-            # move channel to archive category
-            try:
-                await channel.edit(
-                    category=dst_category,
-                    reason=f"Inactive for {ARCHIVE_INACTIVE_DAYS} days, moving to archive.",
-                )
-                archived_count += 1
-                log.info(
-                    f"Archived channel {channel.name} ({channel.id}) due to inactivity."
-                )
-            except Exception as e:
-                log.exception(
-                    f"Failed to archive channel {channel.name} ({channel.id}): {e}"
-                )
-                await self.send_log_message(
-                    f"Failed to archive channel {channel.name} ({channel.id}): {e}"
-                )
-
-        if archived_count > 0:
-            await self.send_log_message(
-                f"Archived {archived_count} old SS-Class channel(s) due to inactivity."
-            )
-        log.info(
-            f"Archive check finished. Archived {archived_count} channel(s) from SS-Class."
-        )
-
-    @archive_old_rooms_loop.before_loop
-    async def before_archive_old_rooms_loop(self):
-        await self.wait_until_ready()
-        log.info(
-            f"Starting archive old rooms loop (runs daily, archives after {ARCHIVE_INACTIVE_DAYS} days of inactivity)..."
-        )
 
 
 # --------------------------
