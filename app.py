@@ -65,6 +65,7 @@ ARCHIVE_INACTIVE_DAYS = int(os.getenv("ARCHIVE_INACTIVE_DAYS", "10"))
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
 
 RESTART_WEBHOOK_URL = "https://discord.com/api/webhooks/1468613841528033473/TUa9LqfYmb5msk0nwvu1ydZgv9e-67XauL7P7c4ple2vuao9Hj4D46qEa6byAC5gPDo6"
+RESTART_NOTIFY_USER_ID = 1339222260904366092
 
 # Admin IDs to mention when a monitored bot goes offline
 ADMIN_IDS = [
@@ -130,16 +131,20 @@ class StatusWatcherBot(commands.Bot):
             except Exception as e:
                 log.exception(f"Failed to send log message to log channel: {e}")
 
-    async def send_restart_webhook(self) -> bool:
+    async def send_restart_webhook(
+        self,
+        target_mention: str,
+        requested_by_mention: str,
+    ) -> bool:
         if not RESTART_WEBHOOK_URL:
             await self.send_log_message(
                 "RESTART_WEBHOOK_URL is not set; restart webhook message was skipped."
             )
             return False
 
-        bot_mention = self.user.mention if self.user else ""
+        notify_mention = f"<@{RESTART_NOTIFY_USER_ID}>" if RESTART_NOTIFY_USER_ID else ""
         payload = {
-            "content": f"restart {bot_mention}".strip(),
+            "content": f"restart {target_mention} | requested by {requested_by_mention} {notify_mention}".strip(),
             "allowed_mentions": {"parse": ["users", "roles", "everyone"]},
         }
 
@@ -370,34 +375,37 @@ async def bot_status_cmd(ctx: commands.Context):
 
 @bot.command(name="restart")
 @commands.cooldown(1, 5 * 60, commands.BucketType.user)
-async def restart_cmd(ctx: commands.Context):
+async def restart_cmd(ctx: commands.Context, target: discord.Member = None):
     now = time.time()
+
+    target_mention = (
+        target.mention
+        if target is not None
+        else (bot.user.mention if bot.user is not None else "")
+    )
 
     if now < bot.global_restart_until:
         msg = await ctx.send(
-            "⚠️ فيه Restart شغال بالفعل.\n"
-            f"⏳ المتوقع الانتهاء: <t:{int(bot.global_restart_until)}:R>"
+            "⚠️ A restart request is already in progress.\n"
+            f"⏳ Expected finish: <t:{int(bot.global_restart_until)}:R>"
         )
         try:
             await ctx.message.delete(delay=30)
         except Exception:
             pass
-        try:
-            await msg.delete(delay=30)
-        except Exception:
-            pass
         return
 
-    ok = await bot.send_restart_webhook()
+    ok = await bot.send_restart_webhook(
+        target_mention=target_mention,
+        requested_by_mention=ctx.author.mention,
+    )
     if not ok:
         ctx.command.reset_cooldown(ctx)
-        msg = await ctx.send("⚠️ حصلت مشكلة وأنا ببعت طلب الـ Restart. جرّب تاني بعد شوية.")
+        msg = await ctx.send(
+            "⚠️ Failed to send the restart request (webhook error). Please try again later."
+        )
         try:
             await ctx.message.delete(delay=30)
-        except Exception:
-            pass
-        try:
-            await msg.delete(delay=30)
         except Exception:
             pass
         return
@@ -406,17 +414,14 @@ async def restart_cmd(ctx: commands.Context):
     bot.global_restart_until = float(end_ts)
 
     msg = await ctx.send(
-        "🔄 تم إرسال طلب إعادة التشغيل.\n"
-        f"⏳ المتوقع الانتهاء: <t:{end_ts}:R>\n"
-        f"{ctx.author.mention} من فضلك استنى لحد الوقت ده قبل ما تستخدم `!restart` تاني."
+        "🔄 Restart request sent.\n"
+        f"🎯 Target: {target_mention}\n"
+        f"⏳ Expected finish: <t:{end_ts}:R>\n"
+        f"{ctx.author.mention} please wait until then before using `!restart` again."
     )
 
     try:
         await ctx.message.delete(delay=30)
-    except Exception:
-        pass
-    try:
-        await msg.delete(delay=30)
     except Exception:
         pass
 
@@ -424,7 +429,9 @@ async def restart_cmd(ctx: commands.Context):
 @watch_cmd.error
 async def watch_cmd_error(ctx: commands.Context, error: Exception):
     if isinstance(error, commands.CommandOnCooldown):
-        await ctx.send(f"⏳ استنى {int(error.retry_after)} ثانية قبل ما تستخدم الأمر تاني.")
+        await ctx.send(
+            f"⏳ Please wait {int(error.retry_after)} second(s) before using this command again."
+        )
         return
     raise error
 
@@ -432,7 +439,9 @@ async def watch_cmd_error(ctx: commands.Context, error: Exception):
 @restart_cmd.error
 async def restart_cmd_error(ctx: commands.Context, error: Exception):
     if isinstance(error, commands.CommandOnCooldown):
-        await ctx.send(f"⏳ استنى {int(error.retry_after)} ثانية قبل ما تستخدم الأمر تاني.")
+        await ctx.send(
+            f"⏳ Please wait {int(error.retry_after)} second(s) before using this command again."
+        )
         return
     raise error
 
