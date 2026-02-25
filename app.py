@@ -43,6 +43,7 @@ LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
 
 RESTART_WEBHOOK_URL = "https://discord.com/api/webhooks/1468613841528033473/TUa9LqfYmb5msk0nwvu1ydZgv9e-67XauL7P7c4ple2vuao9Hj4D46qEa6byAC5gPDo6"
 RESTART_NOTIFY_USER_ID = 1339222260904366092
+RESTART_REQUEST_TTL_SECONDS = 60 * 60
 
 # Admin IDs to mention when a monitored bot goes offline
 ADMIN_IDS = [
@@ -78,7 +79,20 @@ class StatusWatcherBot(commands.Bot):
         super().__init__(command_prefix=("!", "/"), intents=intents)
         self.last_status: dict[int, str] = {}
         self.global_restart_until: float = 0.0
+        self.pending_restart_mentions: dict[int, list[dict[str, int]]] = {}
         self._load_last_status()
+
+    def _prune_pending_restart_mentions(self):
+        now = int(time.time())
+        to_delete = []
+        for bot_id, entries in self.pending_restart_mentions.items():
+            kept = [e for e in entries if e.get("expires_at", 0) > now]
+            if kept:
+                self.pending_restart_mentions[bot_id] = kept
+            else:
+                to_delete.append(bot_id)
+        for bot_id in to_delete:
+            self.pending_restart_mentions.pop(bot_id, None)
 
     def _load_last_status(self):
         try:
@@ -224,7 +238,7 @@ async def on_ready():
 async def on_presence_update(before: discord.Member, after: discord.Member):
     if after.guild is None or after.guild.id != GUILD_ID:
         return
-    if after.id not in MONITORED_BOT_IDS:
+    if after.id not in MONITORED_BOT_IDS and after.id not in bot.pending_restart_mentions:
         return
 
     channel = bot.get_channel(STATUS_CHANNEL_ID)
@@ -246,7 +260,28 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
 
     bot.last_status[after.id] = new_status
     bot._save_last_status()
-    await bot.handle_status_change(channel, after.id, old_status, new_status, offline_states)
+
+    if after.id in MONITORED_BOT_IDS:
+        await bot.handle_status_change(
+            channel, after.id, old_status, new_status, offline_states
+        )
+
+    was_offline = old_status in offline_states
+    is_now_offline = new_status in offline_states
+    if was_offline and not is_now_offline:
+        bot._prune_pending_restart_mentions()
+        entries = bot.pending_restart_mentions.pop(after.id, [])
+        if entries:
+            for entry in entries:
+                channel_id = entry.get("channel_id", 0)
+                user_id = entry.get("user_id", 0)
+                notify_channel = bot.get_channel(channel_id)
+                if not isinstance(notify_channel, discord.TextChannel):
+                    continue
+                if user_id:
+                    await notify_channel.send(
+                        f"✅ <@{user_id}> {after.mention} is now online."
+                    )
 
 
 @bot.event
@@ -361,6 +396,18 @@ async def restart_cmd(ctx: commands.Context, target: discord.Member = None):
         else (bot.user.mention if bot.user is not None else "")
     )
 
+    if target is not None:
+        if not target.bot:
+            await ctx.send("⚠️ Please mention a bot account.")
+            return
+        if target.guild is None or target.guild.id != GUILD_ID:
+            await ctx.send("⚠️ This bot is not in the configured guild.")
+            return
+
+        if bot.last_status.get(target.id) is None:
+            bot.last_status[target.id] = str(target.status)
+            bot._save_last_status()
+
     if now < bot.global_restart_until:
         await ctx.send(
             "⚠️ A restart request is already in progress.\n"
@@ -382,8 +429,20 @@ async def restart_cmd(ctx: commands.Context, target: discord.Member = None):
     end_ts = int(now) + 5 * 60
     bot.global_restart_until = float(end_ts)
 
+    if target is not None:
+        bot._prune_pending_restart_mentions()
+        entries = bot.pending_restart_mentions.setdefault(target.id, [])
+        expires_at = int(now) + RESTART_REQUEST_TTL_SECONDS
+        entries.append(
+            {
+                "user_id": ctx.author.id,
+                "channel_id": ctx.channel.id,
+                "expires_at": expires_at,
+            }
+        )
+
     await ctx.send(
-        f"🔄 Expected restart in <t:{end_ts}:R>"
+        f"🔄 Will restart in <t:{end_ts}:R>"
     )
 
 
